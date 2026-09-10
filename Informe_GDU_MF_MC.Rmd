@@ -1,0 +1,351 @@
+---
+title: "Grados día acumulados hasta la madurez fisiológica y comercial"
+author: "Valentina Tornello"
+date: '`r format(Sys.Date(), "%d/%m/%Y")`'
+lang: es
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+params:
+  archivo_ensayo: "ENSAYO_2018-2019_PROCESADO.xlsx"
+  hoja_ensayo: "BLUP Base"
+  archivo_clima: "CLIMA 1819.xlsx"
+  exportar_csv: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      results = "asis")
+
+paquetes <- c("readxl", "dplyr", "tidyr", "knitr", "ggplot2")
+faltantes <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltantes) > 0) {
+  stop("Instala antes estos paquetes de R: ", paste(faltantes, collapse = ", "))
+}
+invisible(lapply(paquetes, library, character.only = TRUE))
+
+if (!file.exists(params$archivo_ensayo)) {
+  stop("No se encuentra el archivo de ensayo: ", params$archivo_ensayo)
+}
+if (!file.exists(params$archivo_clima)) {
+  stop("No se encuentra el archivo climático: ", params$archivo_clima)
+}
+
+normalizar_nombre <- function(x) {
+  x <- iconv(as.character(x), from = "", to = "ASCII//TRANSLIT")
+  x <- toupper(gsub("[^A-Z0-9]+", "_", x))
+  gsub("(^_|_$)", "", x)
+}
+
+buscar_columna <- function(datos, candidatos, obligatorio = TRUE) {
+  nombres <- normalizar_nombre(names(datos))
+  objetivo <- normalizar_nombre(candidatos)
+  posicion <- match(objetivo, nombres)
+  posicion <- posicion[!is.na(posicion)][1]
+  if (is.na(posicion) && obligatorio) {
+    stop("No se encontró una columna entre: ", paste(candidatos, collapse = ", "))
+  }
+  ifelse(is.na(posicion), NA_character_, names(datos)[posicion])
+}
+
+numero <- function(x) {
+  if (is.numeric(x)) return(x)
+  x <- gsub("%", "", as.character(x), fixed = TRUE)
+  x <- gsub("\\.", "", x)
+  x <- gsub(",", ".", x, fixed = TRUE)
+  suppressWarnings(as.numeric(x))
+}
+
+fecha <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, c("POSIXct", "POSIXlt"))) return(as.Date(x))
+  x <- as.character(x)
+  resultado <- suppressWarnings(as.Date(x, format = "%d/%m/%Y"))
+  faltan <- is.na(resultado)
+  resultado[faltan] <- suppressWarnings(as.Date(x[faltan], format = "%Y-%m-%d"))
+  resultado
+}
+
+clima <- readxl::read_excel(params$archivo_clima, .name_repair = "unique")
+ensayo <- readxl::read_excel(params$archivo_ensayo, sheet = params$hoja_ensayo,
+                             .name_repair = "unique")
+
+col_fecha_clima <- buscar_columna(clima, c("Fecha"))
+col_gdu_temprano <- buscar_columna(clima, c("GDU ACUMULADOS FECHA TEMPRANA"))
+col_gdu_tardio <- buscar_columna(clima, c("GDU ACUMULADOS FECHA TARDÍO",
+                                          "GDU ACUMULADOS FECHA TARDIO"))
+col_ensayo <- buscar_columna(ensayo, c("Ensayo"))
+col_mf <- buscar_columna(ensayo, c("MF"))
+col_mc <- buscar_columna(ensayo, c("MC"))
+col_plot <- buscar_columna(ensayo, c("PLOT", "Plot"), FALSE)
+col_pedigree <- buscar_columna(ensayo, c("PEDIGREE", "Pedigree"), FALSE)
+
+clima_lookup <- clima %>%
+  transmute(
+    FECHA = fecha(.data[[col_fecha_clima]]),
+    GDU_TEMPRANO = numero(.data[[col_gdu_temprano]]),
+    GDU_TARDIO = numero(.data[[col_gdu_tardio]])
+  ) %>%
+  distinct(FECHA, .keep_all = TRUE)
+
+datos_gdu <- ensayo %>%
+  transmute(
+    Ensayo = as.character(.data[[col_ensayo]]),
+    PLOT = if (is.na(col_plot)) NA_character_ else as.character(.data[[col_plot]]),
+    PEDIGREE = if (is.na(col_pedigree)) NA_character_ else as.character(.data[[col_pedigree]]),
+    MF = fecha(.data[[col_mf]]),
+    MC = fecha(.data[[col_mc]])
+  ) %>%
+  mutate(
+    Siembra = case_when(
+      Ensayo == "Temprano" ~ as.Date("2018-09-20"),
+      Ensayo == "Tardío" ~ as.Date("2018-12-10"),
+      TRUE ~ as.Date(NA)
+    )
+  ) %>%
+  left_join(clima_lookup %>% rename(MF = FECHA, GDU_MF_TEMPRANO = GDU_TEMPRANO,
+                                    GDU_MF_TARDIO = GDU_TARDIO), by = "MF") %>%
+  left_join(clima_lookup %>% rename(MC = FECHA, GDU_MC_TEMPRANO = GDU_TEMPRANO,
+                                    GDU_MC_TARDIO = GDU_TARDIO), by = "MC") %>%
+  mutate(
+    GDU_MF = case_when(
+      Ensayo == "Temprano" ~ GDU_MF_TEMPRANO,
+      Ensayo == "Tardío" ~ GDU_MF_TARDIO,
+      TRUE ~ NA_real_
+    ),
+    GDU_MC = case_when(
+      Ensayo == "Temprano" ~ GDU_MC_TEMPRANO,
+      Ensayo == "Tardío" ~ GDU_MC_TARDIO,
+      TRUE ~ NA_real_
+    ),
+    GDU_DESDE_MF_HASTA_MC = GDU_MC - GDU_MF
+  ) %>%
+  select(Ensayo, PLOT, PEDIGREE, Siembra, MF, MC, GDU_MF, GDU_MC,
+         GDU_DESDE_MF_HASTA_MC)
+
+resumen <- datos_gdu %>%
+  group_by(Ensayo) %>%
+  summarise(
+    Parcelas = n(),
+    MF_con_GDU = sum(!is.na(GDU_MF)),
+    MC_con_GDU = sum(!is.na(GDU_MC)),
+    GDU_MF_promedio = mean(GDU_MF, na.rm = TRUE),
+    GDU_MC_promedio = mean(GDU_MC, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.x), NA_real_, .x)))
+
+controles <- tibble::tibble(
+  Control = c("Filas del ensayo", "Fechas MF informadas", "Fechas MC informadas",
+              "MF encontrada en clima", "MC encontrada en clima",
+              "Ensayos reconocidos"),
+  Resultado = c(
+    nrow(datos_gdu), sum(!is.na(datos_gdu$MF)), sum(!is.na(datos_gdu$MC)),
+    sum(!is.na(datos_gdu$GDU_MF)), sum(!is.na(datos_gdu$GDU_MC)),
+    paste(sort(unique(datos_gdu$Ensayo)), collapse = ", ")
+  )
+)
+```
+
+# Resumen
+
+Este informe describe el cálculo de los grados día de crecimiento (GDU) acumulados
+desde la siembra hasta la madurez fisiológica (`GDU_MF`) y hasta la madurez
+comercial (`GDU_MC`) en maíz (*Zea mays* L.) para Pergamino, campaña 2018/19.
+El procedimiento utiliza como entradas las fechas de madurez por parcela y una
+serie climática que ya contiene los GDU acumulados para cada fecha de siembra.
+
+El resultado principal es una tabla por parcela con el ensayo, la fecha de
+siembra, las fechas MF y MC y los valores `GDU_MF` y `GDU_MC`. Los valores se
+obtienen mediante una búsqueda exacta de la fecha fenológica en la tabla
+climática; si una fecha no existe, se conserva como `NA` para su revisión.
+
+# 1. Objetivo y fundamento
+
+Los GDU permiten expresar el desarrollo del cultivo en tiempo térmico. Para cada
+parcela se buscó el valor acumulado correspondiente a la fecha de madurez:
+
+$$
+GDU_{MF} = GDU_{acumulados}(fecha\ MF,\ ensayo)
+$$
+
+$$
+GDU_{MC} = GDU_{acumulados}(fecha\ MC,\ ensayo)
+$$
+
+La diferencia entre ambos representa el tiempo térmico acumulado durante el
+período de secado posterior a la madurez fisiológica:
+
+$$
+GDU_{MF\rightarrow MC} = GDU_{MC} - GDU_{MF}
+$$
+
+En este análisis, los GDU diarios y su acumulación ya fueron calculados en la
+planilla climática. Por lo tanto, este documento no vuelve a estimar la
+temperatura base ni suma temperaturas diarias: asigna a cada parcela el
+acumulado correcto según su ensayo y fecha fenológica.
+
+# 2. Materiales y entradas
+
+Se utilizaron los siguientes archivos parametrizados:
+
+```{r inventario, echo=FALSE}
+inventario <- data.frame(
+  Archivo = c(basename(params$archivo_ensayo), basename(params$archivo_clima)),
+  Hoja_o_contenido = c(params$hoja_ensayo, "Serie diaria con GDU acumulados"),
+  stringsAsFactors = FALSE
+)
+knitr::kable(inventario, caption = "Archivos de entrada")
+```
+
+Las fechas de siembra asignadas por ensayo son:
+
+```{r siembras}
+tabla_siembras <- data.frame(
+  Ensayo = c("Temprano", "Tardío"),
+  Siembra = as.Date(c("2018-09-20", "2018-12-10"))
+)
+knitr::kable(tabla_siembras, caption = "Fechas de siembra utilizadas")
+```
+
+El ensayo temprano se vincula con la columna `GDU ACUMULADOS FECHA TEMPRANA`,
+mientras que el ensayo tardío se vincula con la columna `GDU ACUMULADOS FECHA TARDÍO`.
+Las comas decimales de la planilla se convierten a valores numéricos antes del
+cruce.
+
+# 3. Procedimiento paso a paso
+
+## 3.1 Lectura y normalización
+
+Se leen la hoja `BLUP Base` del archivo de ensayo y la tabla climática. Las
+fechas se convierten al tipo `Date`, y los GDU se convierten a formato numérico.
+La normalización de nombres permite reconocer, por ejemplo, las variantes con
+y sin tilde de `TARDÍO`, sin modificar los nombres de los archivos originales.
+
+## 3.2 Selección de la columna climática
+
+La columna de GDU se selecciona según `Ensayo`:
+
+```{r regla-columna}
+regla <- data.frame(
+  Ensayo = c("Temprano", "Tardío"),
+  Columna_climatica = c("GDU ACUMULADOS FECHA TEMPRANA",
+                        "GDU ACUMULADOS FECHA TARDÍO")
+)
+knitr::kable(regla, caption = "Regla de selección de GDU")
+```
+
+## 3.3 Cruce por fecha de MF y MC
+
+Para cada fila, la fecha `MF` se cruza con `FECHA` de la tabla climática y se
+recupera el acumulado del ensayo correspondiente. El mismo procedimiento se
+repite para `MC`. La identificación de la fecha es exacta, de modo que no se
+interpolan valores entre días.
+
+## 3.4 Variables derivadas
+
+Además de `GDU_MF` y `GDU_MC`, se calcula `GDU_DESDE_MF_HASTA_MC`. Esta última
+variable es descriptiva y no reemplaza a las dos variables acumuladas desde la
+siembra.
+
+# 4. Resultados
+
+## 4.1 Resultado por parcela
+
+La siguiente tabla es el output principal del cálculo. Cada fila conserva la
+identificación de la parcela y del pedigree para permitir su posterior uso en
+la base `BLUP_base` y en análisis de correlación o GWAS.
+
+```{r tabla-principal}
+knitr::kable(
+  datos_gdu,
+  digits = 2,
+  caption = "GDU acumulados desde siembra hasta MF y MC"
+)
+```
+
+## 4.2 Resumen descriptivo
+
+```{r resumen}
+knitr::kable(
+  resumen,
+  digits = 2,
+  caption = "Resumen de completitud y valores medios por ensayo"
+)
+```
+
+Los promedios se calculan únicamente con valores disponibles. El número de
+registros con GDU permite distinguir entre una fecha fenológica ausente y una
+fecha que no pudo localizarse en la serie climática.
+
+```{r distribucion, fig.cap="Distribución de GDU_MF y GDU_MC por ensayo."}
+datos_gdu %>%
+  select(Ensayo, GDU_MF, GDU_MC) %>%
+  pivot_longer(c(GDU_MF, GDU_MC), names_to = "Etapa", values_to = "GDU") %>%
+  ggplot(aes(x = Ensayo, y = GDU, fill = Etapa)) +
+  geom_boxplot(na.rm = TRUE, position = position_dodge(width = 0.75)) +
+  labs(x = NULL, y = "GDU acumulados", fill = "Etapa") +
+  theme_minimal()
+```
+
+# 5. Controles de calidad
+
+```{r controles}
+knitr::kable(controles, caption = "Controles de completitud del cálculo")
+```
+
+Los `NA` tienen significado diagnóstico:
+
+* `MF` o `MC` ausente indica que la fecha no fue informada en la base fenológica;
+* `GDU_MF` o `GDU_MC` ausente con fecha informada indica que esa fecha no fue
+  encontrada en la tabla climática;
+* un ensayo no reconocido no recibe una columna climática por prevención.
+
+Por eso no se reemplazan los faltantes por cero. Antes de continuar con modelos
+estadísticos, deben revisarse las fechas y la cobertura de la serie climática.
+
+# 6. Reproducibilidad y exportación opcional
+
+El informe puede renderizarse con los archivos ubicados en la carpeta del
+proyecto. También admite cambiar las entradas mediante `params`, por ejemplo
+para otra campaña o una hoja equivalente:
+
+```r
+rmarkdown::render(
+  "Informe_GDU_MF_MC.Rmd",
+  params = list(
+    archivo_ensayo = "ENSAYO_2018-2019_PROCESADO.xlsx",
+    hoja_ensayo = "BLUP Base",
+    archivo_clima = "CLIMA 1819.xlsx"
+  )
+)
+```
+
+Cuando se necesite una tabla plana para continuar el análisis, puede agregarse
+un chunk de exportación basado en `datos_gdu`:
+
+```{r exportacion, eval=FALSE}
+if (isTRUE(params$exportar_csv)) {
+  write.csv(datos_gdu, "resultados_GDU_MF_MC.csv", row.names = FALSE,
+            na = "NA", fileEncoding = "UTF-8")
+}
+```
+
+# 7. Conclusión
+
+El flujo implementado convierte fechas y acumulados a formatos comparables,
+selecciona la serie térmica según el ambiente de siembra y asigna los GDU de MF
+y MC mediante un cruce reproducible por fecha. La salida conserva la unidad de
+análisis parcela-pedigree y deja trazables tanto los resultados como los casos
+que requieren revisión.
+
+# Referencias
+
+Ritchie, J. T., & Nesmith, D. S. (1991). Temperature and crop development. En
+*Modeling plant and soil systems* (pp. 5--29).
+
+Ritchie, S. W., & Hanway, J. J. (1982). *How a corn plant develops*. Iowa State
+University, Special Report No. 48.

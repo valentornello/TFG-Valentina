@@ -1,0 +1,59 @@
+
+# Cargamos nuevamente datos
+df = pd.read_excel("ENSAYO_2018-19_GDUs.xlsx", sheet_name= "HUM TARD", decimal=",")
+
+# Convertimos "HUM" a numérico por si hay valores no reconocidos como número
+df["HUM X"] = pd.to_numeric(df["HUM"], errors="coerce")
+
+# ------ MADUREZ FISIOLÓGICA -----
+# Filtramos por humedad entre 32% y 40% para MF
+df_mf = df[(df["HM X"] >= 32) & (df["HM X"] <= 40)]
+
+# ------ MADUREZ COMERCIAL -----
+# Filtramos por humedad entre 10% y 16% para MC
+df_mc = df[(df["HM X"] >= 10) & (df["HM X"] <= 16)]
+
+# Encontramos el máximo Peso Seco dentro del rango para cada Plot (único valor MF por Plot)
+df_mf = df_mf.loc[df_mf.groupby("Plot")["Peso Seco"].idxmax()]
+
+# Encontramos el primer registro dentro del rango de MC para cada Plot (único valor MC por Plot)
+df_mc = df_mc.loc[df_mc.groupby("Plot")["Fecha"].idxmin()]
+
+# Inicializamos las columnas como False para asegurarnos de que solo se marquen las correctas
+df["Madurez_Fisiologica"] = False
+df["Madurez_Comercial"] = False
+
+# Asignamos True solo a las filas seleccionadas
+df.loc[df_mf.index, "Madurez_Fisiologica"] = True
+df.loc[df_mc.index, "Madurez_Comercial"] = True
+
+# Guardamos el DataFrame actualizado
+df.to_excel("DATOS_TFG_CORREGIDO.xlsx", index=False)
+
+# Cargamos los datos con el formato original
+df = pd.read_excel("ENSAYO_2018-19_GDUs.xlsx", sheet_name="HUM TEMP", decimal=",")
+
+# Convertimos "HUM" a numérico por si hay valores no reconocidos como número
+df["HUM"] = pd.to_numeric(df["HUM"], errors="coerce")
+
+# ------ MADUREZ FISIOLÓGICA -----
+# Filtramos por humedad entre 32% y 40% para MF
+df_mf = df[(df["HUM"] >= 32) & (df["HUM"] <= 40)]
+
+# ------ MADUREZ COMERCIAL -----
+# Filtramos por humedad entre 10% y 16% para MC
+df_mc = df[(df["HUM"] >= 10) & (df["HUM"] <= 16)]
+
+# Encontramos el máximo Peso Seco dentro del rango para cada Plot (único valor MF por Plot)
+df_mf = df_mf.loc[df_mf.groupby("Plot")["Peso Seco"].idxmax()]
+
+# Encontramos el primer registro dentro del rango de MC para cada Plot (único valor MC por Plot)
+df_mc = df_mc.loc[df_mc.groupby("Plot")["Fecha"].idxmin()]
+
+# Creamos las columnas y asignamos el valor False por defecto para mantener el formato
+df["Madurez_Fisiologica"] = False
+df["Madurez_Comercial"] = False
+
+# Asignamos True solo a las filas correspondientes
+df.loc[df_mf.index, "Madurez_Fisiologica"] = True
+df.loc[df_mc.index, "Madurez_Comercial"] = True
