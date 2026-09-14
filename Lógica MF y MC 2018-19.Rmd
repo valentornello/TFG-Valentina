@@ -1,0 +1,474 @@
+---
+title: "Transformación reproducible de las planillas del TFG"
+author: "Valentina Tornello"
+date: '`r format(Sys.Date(), "%d/%m/%Y")`'
+output:
+
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+params:
+  archivo_ensayo: "ENSAYO_2018-2019_Tornello.xlsx"
+  archivo_clima: "CLIMA 1819.xlsx"
+  carpeta_salida: "resultados_rmd"
+  exportar_excel: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+											results = "asis")
+
+formato_tabla <- if (knitr::is_latex_output()) "latex" else "html"
+
+paquetes <- c("readxl", "dplyr", "tidyr", "purrr", "stringr", "lubridate",
+							"knitr", "openxlsx")
+faltantes <- paquetes[!vapply(paquetes, requireNamespace, logical(1), quietly = TRUE)]
+if (length(faltantes) > 0) {
+	stop("Instala antes estos paquetes de R: ", paste(faltantes, collapse = ", "))
+}
+invisible(lapply(paquetes, library, character.only = TRUE))
+
+dir.create(params$carpeta_salida, showWarnings = FALSE, recursive = TRUE)
+archivo_ensayo <- params$archivo_ensayo
+if (!file.exists(archivo_ensayo) && file.exists("ENSAYO_2018-19_GDUs.xlsx")) {
+	archivo_ensayo <- "ENSAYO_2018-19_GDUs.xlsx"
+}
+if (!file.exists(archivo_ensayo)) stop("No se encuentra el Excel de ensayo: ", archivo_ensayo)
+if (!file.exists(params$archivo_clima)) stop("No se encuentra el Excel climático: ", params$archivo_clima)
+
+# Se usa esta normalización solo para buscar columnas; se conservan los nombres originales.
+normalizar_nombre <- function(x) {
+	x <- iconv(as.character(x), from = "", to = "ASCII//TRANSLIT")
+	x <- toupper(gsub("[^A-Z0-9]+", "_", x))
+	gsub("(^_|_$)", "", x)
+}
+
+buscar_columna <- function(datos, candidatos, obligatorio = TRUE) {
+	nombres <- normalizar_nombre(names(datos))
+	objetivo <- normalizar_nombre(candidatos)
+	posicion <- match(objetivo, nombres)
+	posicion <- posicion[!is.na(posicion)][1]
+	if (is.na(posicion) && obligatorio) {
+		stop("Falta una columna requerida. Se esperaba una de: ", paste(candidatos, collapse = ", "))
+	}
+	ifelse(is.na(posicion), NA_character_, names(datos)[posicion])
+}
+
+numero <- function(x) {
+	if (is.numeric(x)) return(x)
+	x <- gsub("%", "", as.character(x), fixed = TRUE)
+	x <- gsub("\\.", "", x)
+	x <- gsub(",", ".", x, fixed = TRUE)
+	suppressWarnings(as.numeric(x))
+}
+
+fecha <- function(x) {
+	if (inherits(x, "Date")) return(x)
+	if (inherits(x, c("POSIXct", "POSIXlt"))) return(as.Date(x))
+	suppressWarnings(as.Date(parse_date_time(as.character(x),
+																					 orders = c("dmy", "ymd", "dmY", "Ymd"),
+																					 quiet = TRUE)))
+}
+
+leer_hoja <- function(archivo, hoja) {
+	datos <- readxl::read_excel(archivo, sheet = hoja, .name_repair = "unique")
+	names(datos) <- trimws(names(datos))
+	datos
+}
+
+mostrar_paso <- function(titulo, datos, n = 6) {
+	cat("\n### ", titulo, "\n\n", sep = "")
+	cat("Filas: ", nrow(datos), " | Columnas: ", ncol(datos), "\n\n", sep = "")
+	print(knitr::kable(utils::head(datos, n), format = formato_tabla, caption = titulo))
+}
+
+columna_fecha <- function(datos, candidatos) {
+	nombre <- buscar_columna(datos, candidatos)
+	fecha(datos[[nombre]])
+}
+
+normalizar_humedad <- function(datos) {
+	plot <- buscar_columna(datos, c("PLOT", "Plot"))
+	fecha_col <- buscar_columna(datos, c("Fecha", "DATE"))
+	hum <- buscar_columna(datos, c("HUM", "HUM X", "HUMEDAD"))
+	peso <- buscar_columna(datos, c("Peso Seco", "Peso Seco Mil", "PESO GRANO"), FALSE)
+	if (is.na(peso)) stop("La hoja de humedad no contiene una columna de peso seco/grano.")
+	datos %>%
+		mutate(
+			PLOT_ID = as.character(.data[[plot]]) %>% str_trim(),
+			FECHA_CALCULO = fecha(.data[[fecha_col]]),
+			HUM_CALCULO = numero(.data[[hum]]),
+			PESO_CALCULO = numero(.data[[peso]])
+		)
+}
+
+clasificar_comportamiento <- function(datos) {
+	datos %>%
+		arrange(PLOT_ID, FECHA_CALCULO) %>%
+		group_by(PLOT_ID) %>%
+		mutate(
+			DIF_HUM = HUM_CALCULO - lag(HUM_CALCULO),
+			DIF_PESO = PESO_CALCULO - lag(PESO_CALCULO),
+			COMPORTAMIENTO_HUM = if_else(is.na(DIF_HUM) | DIF_HUM <= 0,
+																	 "Esperado", "No esperado"),
+			COMPORTAMIENTO_PESO = if_else(is.na(DIF_PESO) | DIF_PESO >= 0,
+																		"Esperado", "No esperado"),
+			FILA_VALIDA = COMPORTAMIENTO_HUM == "Esperado" &
+										COMPORTAMIENTO_PESO == "Esperado"
+		) %>%
+		ungroup()
+}
+
+calcular_madurez <- function(datos) {
+	datos %>%
+		group_by(PLOT_ID) %>%
+		group_modify(~ {
+			grupo <- arrange(.x, FECHA_CALCULO)
+			mf_candidatos <- grupo %>% filter(between(HUM_CALCULO, 32, 40))
+			mf <- if (nrow(mf_candidatos) == 0) as.Date(NA) else
+				mf_candidatos$FECHA_CALCULO[which.max(mf_candidatos$PESO_CALCULO)]
+			mc_candidatos <- grupo %>% filter(between(HUM_CALCULO, 10, 16))
+			mc <- if (nrow(mc_candidatos) == 0) as.Date(NA) else min(mc_candidatos$FECHA_CALCULO)
+			hum_mf <- grupo$HUM_CALCULO[match(mf, grupo$FECHA_CALCULO)]
+			hum_mc <- grupo$HUM_CALCULO[match(mc, grupo$FECHA_CALCULO)]
+			dias <- as.numeric(mc - mf)
+			tibble(
+				FECHA_MF = mf,
+				FECHA_MC = mc,
+				HUM_MF = hum_mf,
+				HUM_MC = hum_mc,
+				TSG = ifelse(!is.na(dias) & dias > 0, (hum_mf - hum_mc) / dias, NA_real_),
+				TIENE_MF = !is.na(mf),
+				TIENE_MC = !is.na(mc),
+				PORCENTAJE_FILAS_VALIDAS = mean(grupo$FILA_VALIDA, na.rm = TRUE),
+				DECISION_AUTO = case_when(
+					!TIENE_MF ~ "Se descarta",
+					TIENE_MF & TIENE_MC ~ "Plot válido",
+					TIENE_MF & !TIENE_MC & PORCENTAJE_FILAS_VALIDAS >= 0.5 ~ "Duda",
+					TRUE ~ "Se descarta"
+				)
+			)
+		}) %>%
+		ungroup()
+}
+
+procesar_humedad <- function(datos) {
+	datos_normalizados <- datos %>%
+		normalizar_humedad() %>%
+		clasificar_comportamiento()
+	resumen <- calcular_madurez(datos_normalizados)
+	datos_procesados <- datos_normalizados %>%
+		select(-any_of(c("FECHA_MF", "FECHA_MC", "HUM_MF", "HUM_MC", "TSG",
+																 "TIENE_MF", "TIENE_MC", "PORCENTAJE_FILAS_VALIDAS",
+																 "DECISION_AUTO", "DECISION_MANUAL", "DECISION_FINAL"))) %>%
+		left_join(resumen, by = "PLOT_ID")
+
+	col_decision <- buscar_columna(datos, c("Decisión", "Decision"), FALSE)
+	if (!is.na(col_decision)) {
+		plot_original <- buscar_columna(datos, c("PLOT", "Plot"))
+		decisiones_manuales <- datos %>%
+			transmute(
+				PLOT_ID = as.character(.data[[plot_original]]) %>% str_trim(),
+				DECISION_MANUAL = na_if(str_trim(as.character(.data[[col_decision]])), "")
+			) %>%
+			group_by(PLOT_ID) %>%
+			summarise(DECISION_MANUAL = first(na.omit(DECISION_MANUAL), default = NA_character_),
+								.groups = "drop")
+		datos_procesados <- datos_procesados %>%
+			left_join(decisiones_manuales, by = "PLOT_ID") %>%
+			mutate(DECISION_FINAL = coalesce(DECISION_MANUAL, DECISION_AUTO))
+	} else {
+		datos_procesados <- datos_procesados %>% mutate(DECISION_FINAL = DECISION_AUTO)
+	}
+	datos_procesados
+}
+
+calcular_gdu <- function(datos, clima, tipo) {
+	vt <- buscar_columna(datos, c("VT"))
+	r1 <- buscar_columna(datos, c("R1"))
+	f_clima <- buscar_columna(clima, c("Fecha"))
+	gdu_col <- if (tipo == "Temprano") {
+		buscar_columna(clima, c("GDU ACUMULADOS FECHA TEMPRANA"))
+	} else {
+		buscar_columna(clima, c("GDU ACUMULADOS FECHA TARDÍO", "GDU ACUMULADOS FECHA TARDIO"))
+	}
+	lookup <- tibble(FECHA = fecha(clima[[f_clima]]), GDU = numero(clima[[gdu_col]]))
+	datos %>%
+		mutate(VT_CALCULO = fecha(.data[[vt]]), R1_CALCULO = fecha(.data[[r1]])) %>%
+		select(-any_of(c("GDU_VT", "GDU_R1", "GDU_ASI"))) %>%
+		left_join(lookup %>% rename(VT_CALCULO = FECHA, GDU_VT = GDU), by = "VT_CALCULO") %>%
+		left_join(lookup %>% rename(R1_CALCULO = FECHA, GDU_R1 = GDU), by = "R1_CALCULO") %>%
+		mutate(GDU_ASI = GDU_R1 - GDU_VT)
+}
+
+unificar_ensayos <- function(temprano, tardio) {
+	seleccionar <- function(datos, tipo) {
+		plot <- buscar_columna(datos, c("PLOT", "Plot"))
+		pedigree <- buscar_columna(datos, c("PEDIGREE", "Pedigree"), FALSE)
+		datos %>% transmute(
+			Año = 2018L, Localidad = "Pergamino", Ensayo = tipo,
+			PLOT = as.character(.data[[plot]]),
+			PEDIGREE = if (is.na(pedigree)) NA_character_ else as.character(.data[[pedigree]]),
+			GDU_VT, GDU_R1, GDU_ASI
+		)
+	}
+	bind_rows(seleccionar(temprano, "Temprano"), seleccionar(tardio, "Tardío"))
+}
+
+escribir_sin_perder_formato <- function(origen, destino, hojas) {
+	file.copy(origen, destino, overwrite = TRUE)
+	wb <- openxlsx::loadWorkbook(destino)
+	for (nombre_hoja in names(hojas)) {
+		if (!nombre_hoja %in% names(wb)) next
+		ws <- wb[[nombre_hoja]]
+		encabezados <- as.character(openxlsx::read.xlsx(wb, sheet = nombre_hoja,
+																										rows = 1, colNames = FALSE)[1, ])
+		datos <- hojas[[nombre_hoja]]
+		for (nombre in names(datos)) {
+			posicion <- match(normalizar_nombre(nombre), normalizar_nombre(encabezados))
+			if (!is.na(posicion)) {
+				valores <- datos[[nombre]]
+				valores <- if (inherits(valores, "Date")) as.character(valores) else valores
+				openxlsx::writeData(wb, nombre_hoja, valores, startCol = posicion,
+														startRow = 2, colNames = FALSE, keepNA = FALSE)
+			}
+		}
+	}
+	openxlsx::saveWorkbook(wb, destino, overwrite = TRUE)
+	destino
+}
+```
+
+# Objetivo y reglas
+
+Este informe documenta y reproduce en R el tratamiento de los datos de la campaña 2018--2019 de Pergamino, siguiendo el flujo desarrollado en `TFG Valentina.ipynb` y `TFG-MF-MC.ipynb`. El propósito es transformar las planillas originales en una base auditable, conservando la correspondencia entre cada parcela (`PLOT`), sus fechas fenológicas, sus observaciones de humedad y peso seco, y los grados día de crecimiento (GDU). Cada bloque conserva el orden analítico de la transformación:
+
+1. leer la hoja original y comprobar sus dimensiones;
+2. normalizar fechas, identificadores y variables numéricas;
+3. calcular GDU_VT, GDU_R1 y `GDU_ASI = GDU_R1 - GDU_VT`;
+4. clasificar cada observación según la tendencia temporal de la humedad y del peso seco;
+5. identificar la MF dentro del intervalo de 32--40% de humedad, utilizando el máximo peso seco como evidencia del cese de la acumulación de materia seca;
+6. identificar la MC como la primera fecha observada dentro del intervalo de 10--16% de humedad;
+7. calcular `TSG = (HUM_MF - HUM_MC) / días entre MF y MC`;
+8. conservar la decisión manual cuando exista y exportar sobre una copia del Excel original.
+
+Las dos ventanas de humedad y la fórmula de TSG son las reglas explícitas de los notebooks. En este procesamiento, la variable observada es la humedad de la semilla y no la temperatura del aire: la temperatura se utiliza posteriormente para calcular GDU a partir de la serie climática. Por tanto, la etiqueta de madurez no se asigna a partir de una temperatura medida en el muestreo, sino a partir de la combinación de humedad y peso seco.
+
+Una observación se clasifica como comportamiento esperado cuando, respecto del muestreo anterior de la misma parcela, la humedad no aumenta (`DIF_HUM <= 0`) y el peso seco no disminuye (`DIF_PESO >= 0`). Si alguna de estas tendencias se invierte, la fila se marca como no esperada (`FILA_VALIDA = FALSE`) y queda identificada para revisión; no se elimina silenciosamente. Los valores faltantes no se interpretan como evidencia de una tendencia y deben revisarse en la planilla original.
+
+La condición `TIENE_MF = TRUE` se obtiene únicamente cuando existe al menos un muestreo dentro de 32--40% de humedad. Entre esos candidatos, la fecha de MF es la correspondiente al mayor peso seco. En consecuencia, un plot sin observación en dicha ventana no permite estimar la MF y se descarta automáticamente (`DECISION_AUTO = "Se descarta"`), porque no sería metodológicamente válido reemplazar una fecha ausente por una extrapolación arbitraria. La MC puede quedar pendiente cuando no se observa una humedad de 10--16%; en ese caso el plot se conserva como duda solo si dispone de MF y al menos 50% de sus filas presenta el comportamiento esperado.
+
+La MC también puede estimarse mediante extrapolación de la curva de secado hasta el valor convencional de 14,5% de humedad, siempre que exista una serie suficiente y un modelo de secado validado. Esta extrapolación es conceptualmente admisible porque la MC se define por un umbral de humedad. No se aplica el mismo procedimiento a la MF: la MF no es un umbral fijo de humedad, sino un evento fisiológico asociado al máximo peso seco y al cese de la acumulación de materia seca. Además, la relación entre humedad y tiempo durante el secado es no lineal y puede presentar un comportamiento logarítmico; extrapolarla hasta la MF produciría una fecha dependiente del modelo y no una observación del evento fisiológico. En este Rmd se adopta, por ello, una regla conservadora: la MC se identifica con la primera fecha observada entre 10 y 16%, y no se genera automáticamente una fecha extrapolada a 14,5%.
+
+# 1. Inventario de entradas
+
+```{r inventario}
+hojas_ensayo <- readxl::excel_sheets(archivo_ensayo)
+hojas_clima <- readxl::excel_sheets(params$archivo_clima)
+inventario <- tibble(
+	Archivo = c(basename(archivo_ensayo), basename(params$archivo_clima)),
+	Hojas = c(paste(hojas_ensayo, collapse = "; "), paste(hojas_clima, collapse = "; "))
+)
+knitr::kable(inventario, format = formato_tabla, caption = "Archivos y hojas detectados")
+```
+
+El libro principal debe contener las hojas `ENS TEMP 201819`, `ENS TARDIO 201819`, `HUM TEMP` y `HUM TARD`. Si los nombres difieren, se detiene el informe para evitar cruces silenciosos.
+
+```{r carga}
+hojas_requeridas <- c("ENS TEMP 201819", "ENS TARDIO 201819", "HUM TEMP", "HUM TARD")
+if (!all(hojas_requeridas %in% hojas_ensayo)) {
+	stop("Faltan hojas requeridas: ", paste(setdiff(hojas_requeridas, hojas_ensayo), collapse = ", "))
+}
+clima <- leer_hoja(params$archivo_clima, hojas_clima[1])
+ensayo_temprano_original <- leer_hoja(archivo_ensayo, "ENS TEMP 201819")
+ensayo_tardio_original <- leer_hoja(archivo_ensayo, "ENS TARDIO 201819")
+hum_temprano_original <- leer_hoja(archivo_ensayo, "HUM TEMP")
+hum_tardio_original <- leer_hoja(archivo_ensayo, "HUM TARD")
+```
+
+# 2. GDU por fecha climática
+
+Los GDU se calculan usando una temperatura base de `Tb = 8 C`. Desde la
+siembra hasta la floración, el aporte diario es la temperatura media del día
+menos `Tb`:
+
+$$GDU_d = \frac{T_{max,d} + T_{min,d}}{2} - 8$$
+
+Una vez alcanzada la floración femenina (`R1`), las temperaturas estivales ya
+superan esa temperatura base; por ello, desde `R1` no se continúa restando
+`Tb` y el aporte diario corresponde a la temperatura media del día. Las
+columnas climáticas de GDU acumulados utilizadas en este informe ya fueron
+construidas con esta convención. La fecha `VT` y la fecha `R1` se buscan en la
+tabla climática. Para el ensayo temprano se usa la columna de GDU acumulados
+tempranos y para el tardío la columna de GDU acumulados tardíos. Finalmente,
+`GDU_ASI` se obtiene como `GDU_R1 - GDU_VT`.
+
+```{r gdu}
+ensayo_temprano_gdu <- calcular_gdu(ensayo_temprano_original, clima, "Temprano")
+ensayo_tardio_gdu <- calcular_gdu(ensayo_tardio_original, clima, "Tardío")
+resumen_gdu <- bind_rows(
+	ensayo_temprano_gdu %>% transmute(Ensayo = "Temprano", GDU_VT, GDU_R1, GDU_ASI),
+	ensayo_tardio_gdu %>% transmute(Ensayo = "Tardío", GDU_VT, GDU_R1, GDU_ASI)
+) %>% group_by(Ensayo) %>% summarise(across(where(is.numeric), ~ sum(!is.na(.x))), .groups = "drop")
+knitr::kable(resumen_gdu, format = formato_tabla, caption = "Número de valores calculados de GDU")
+```
+
+```{r gdu-ejemplo}
+mostrar_paso("Ejemplo del cálculo de GDU", ensayo_temprano_gdu %>%
+	select(any_of(c("PLOT", "VT", "R1", "VT_CALCULO", "R1_CALCULO", "GDU_VT", "GDU_R1", "GDU_ASI"))))
+```
+
+# 3. Humedad, comportamiento y madurez
+
+La campaña 2018--2019 se evaluó mediante muestreos sucesivos de cada plot. Para cada registro se normalizaron el identificador de parcela, la fecha, la humedad de semilla y el peso seco. La secuencia se ordenó cronológicamente dentro de cada plot para que las comparaciones representaran la evolución del mismo material a través del tiempo. La temperatura no forma parte de esta decisión fenológica puntual; su función en el flujo es aportar la serie climática necesaria para expresar el desarrollo en GDU.
+
+## Criterio de madurez fisiológica
+
+La MF se definió operacionalmente como el muestreo en el que el peso seco del grano alcanzó su valor máximo dentro de la ventana de 32--40% de humedad. Esta ventana permite localizar el período en el que el grano se aproxima al final del llenado, mientras que el máximo peso seco constituye el indicador cuantitativo del cese de la acumulación neta de materia seca. Por ello, `TIENE_MF = TRUE` no significa simplemente que el plot haya sido muestreado: significa que existe una observación utilizable dentro de la ventana y que puede asociarse a una fecha de MF.
+
+La MF no se obtiene extrapolando la humedad hasta 14,5%. Ese valor corresponde a una condición de humedad comercial, no al punto fisiológico en el que finaliza el llenado. La pérdida de humedad posterior a la MF sigue una dinámica de secado no lineal, que puede aproximarse mediante una función logarítmica; por esta razón, una extrapolación de la curva de humedad no constituye una estimación directa de la MF. Si no existe ningún muestreo en 32--40%, el plot se descarta para los análisis que requieren MF, aunque se conserven sus registros originales para trazabilidad.
+
+## Criterio de madurez comercial
+
+La MC se definió como la primera fecha cronológica en la que la humedad de semilla se encuentra entre 10 y 16%. Este intervalo operacional contiene el valor de referencia de 14,5%, utilizado habitualmente para expresar la humedad comercial. Cuando se dispone de una curva de secado suficientemente densa, es posible ajustar dicha curva y extrapolar la fecha en la que la humedad alcanza exactamente 14,5%. Esa estimación debe informarse como extrapolada y acompañarse del modelo y su incertidumbre; no debe confundirse con una observación directa. El presente procesamiento no realiza ese ajuste: utiliza la primera observación dentro del intervalo 10--16%.
+
+## Control de la trayectoria de cada plot
+
+El criterio de calidad se aplica a cada intervalo entre muestreos. Una fila es válida cuando la humedad se mantiene o disminuye y el peso seco se mantiene o aumenta. En términos de diferencias, se exige `DIF_HUM <= 0` y `DIF_PESO >= 0`. Una fila que incumple cualquiera de las dos condiciones se etiqueta como `No esperado`; esto permite identificar aumentos puntuales de humedad o pérdidas de peso que pueden deberse a error de medición, identificación, muestreo o variación no compatible con la trayectoria esperada.
+
+El descarte definitivo del plot se fundamenta en la posibilidad de estimar la MF: si `TIENE_MF = FALSE`, la decisión automática es `Se descarta`. La ausencia de MC no tiene el mismo efecto, porque el plot puede conservarse para revisión cuando la MF está disponible y la proporción de filas válidas es al menos 0,5; se etiqueta entonces como `Duda`. La decisión manual existente en la planilla tiene prioridad sobre la decisión automática al formar `DECISION_FINAL`, pero no modifica los valores calculados ni oculta las filas clasificadas como no esperadas.
+
+```{r humedad}
+hum_temprano_procesado <- procesar_humedad(hum_temprano_original)
+hum_tardio_procesado <- procesar_humedad(hum_tardio_original)
+
+resumen_humedad <- bind_rows(
+	hum_temprano_procesado %>% distinct(PLOT_ID, .keep_all = TRUE) %>% transmute(Ensayo = "Temprano", PLOT_ID, FECHA_MF, FECHA_MC, TSG, DECISION_AUTO),
+	hum_tardio_procesado %>% distinct(PLOT_ID, .keep_all = TRUE) %>% transmute(Ensayo = "Tardío", PLOT_ID, FECHA_MF, FECHA_MC, TSG, DECISION_AUTO)
+) %>% group_by(Ensayo, DECISION_AUTO) %>% summarise(Plots = n(), .groups = "drop")
+knitr::kable(resumen_humedad, format = formato_tabla, caption = "Decisiones automáticas por ensayo")
+```
+
+La tabla siguiente permite auditar una parcela concreta: diferencias entre muestreos, clasificación de cada fila, fechas MF y MC y TSG resultante.
+
+```{r auditoria}
+auditoria <- hum_temprano_procesado %>%
+	select(PLOT_ID, FECHA_CALCULO, HUM_CALCULO, PESO_CALCULO, DIF_HUM, DIF_PESO,
+				 COMPORTAMIENTO_HUM, COMPORTAMIENTO_PESO, FILA_VALIDA,
+				 FECHA_MF, FECHA_MC, TSG, DECISION_AUTO, DECISION_FINAL)
+mostrar_paso("Trazabilidad fila a fila del ensayo temprano", auditoria)
+```
+
+```{r formulas, echo=TRUE}
+# Reglas numéricas aplicadas a cada parcela:
+# MF: 32 <= HUM_CALCULO <= 40 y máximo PESO_CALCULO.
+# MC: primera FECHA_CALCULO con 10 <= HUM_CALCULO <= 16.
+# TSG: (HUM_MF - HUM_MC) / as.numeric(FECHA_MC - FECHA_MF).
+```
+
+# 4. Base final común
+
+```{r base-final}
+base_final <- unificar_ensayos(ensayo_temprano_gdu, ensayo_tardio_gdu)
+mostrar_paso("Base final unificada", base_final)
+```
+
+La base final usa las mismas columnas para ambos ensayos: año, localidad, tipo de ensayo, parcela, pedigree y las tres variables GDU. Esto permite anexar nuevos años o localidades sin cambiar el formato de salida.
+
+# Anexo A. Fechas de siembra por campaña y localidad
+
+La siguiente tabla recoge las fechas de siembra proporcionadas para calcular posteriormente los GDU desde siembra hasta madurez fisiológica (`GDU_MF`) y desde siembra hasta madurez comercial (`GDU_MC`). El guion de Marcos Juárez en la siembra temprana 2015/16 se conserva como dato faltante porque no se proporcionó una fecha.
+
+```{r anexo-siembras}
+tabla_siembras <- tibble(
+	CAMPAÑA = c("2015/16", "2015/16", "2016/17", "2018/19", "2019/20", "2023/24"),
+	LOCALIDAD = c("Pergamino", "Marcos Juárez", "Pergamino", "Pergamino", "Pergamino", "Pergamino"),
+	SIEMBRA_TEMPRANA = as.Date(c("2015-10-05", NA, "2016-10-03", "2018-09-20", "2019-09-26", "2023-11-03")),
+	SIEMBRA_TARDÍA = as.Date(c("2016-01-12", "2015-12-11", "2016-12-14", "2018-12-10", "2019-12-10", "2023-12-22"))
+) %>%
+	mutate(
+		SIEMBRA_TEMPRANA = format(SIEMBRA_TEMPRANA, "%d/%m/%Y"),
+		SIEMBRA_TARDÍA = format(SIEMBRA_TARDÍA, "%d/%m/%Y")
+	)
+
+knitr::kable(
+	tabla_siembras,
+	format = formato_tabla,
+	caption = "Anexo A. Fechas de siembra por campaña y localidad",
+	align = c("l", "l", "c", "c")
+)
+```
+
+Para obtener los GDU desde siembra, las fechas de este anexo se cruzarán con la tabla climática de la campaña correspondiente. Por tanto, esta tabla funciona como la referencia de entrada y no sustituye a la comprobación de que la fecha exista en la serie climática.
+
+# 5. Exportación con formato Excel
+
+Se escribe una copia del archivo original. Solo se actualizan las columnas que ya existen en cada hoja; por ello se conservan los colores, anchos y estilos de la plantilla. La base común se guarda además en un libro de resultados con hojas separadas y nombres estables.
+
+```{r exportacion}
+salida_formateada <- file.path(params$carpeta_salida,
+															 paste0(tools::file_path_sans_ext(basename(archivo_ensayo)), "_procesado.xlsx"))
+
+if (isTRUE(params$exportar_excel)) {
+	hojas_para_plantilla <- list(
+		"ENS TEMP 201819" = ensayo_temprano_gdu %>% select(any_of(c("GDU_VT", "GDU_R1", "GDU_ASI"))),
+		"ENS TARDIO 201819" = ensayo_tardio_gdu %>% select(any_of(c("GDU_VT", "GDU_R1", "GDU_ASI"))),
+		"HUM TEMP" = hum_temprano_procesado %>%
+			transmute(PLOT = PLOT_ID, TSG, `Decisión` = DECISION_FINAL),
+		"HUM TARD" = hum_tardio_procesado %>%
+			transmute(PLOT = PLOT_ID, TSG, `Decisión` = DECISION_FINAL)
+	)
+	escribir_sin_perder_formato(archivo_ensayo, salida_formateada, hojas_para_plantilla)
+
+	salida_base <- file.path(params$carpeta_salida, "BASE_DATOS_UNIFICADA_R.xlsx")
+	openxlsx::write.xlsx(
+		list(
+			ENS_TEMP_1819 = ensayo_temprano_gdu,
+			ENS_TARDIO_1819 = ensayo_tardio_gdu,
+			HUM_TEMP = hum_temprano_procesado,
+			HUM_TARD = hum_tardio_procesado,
+			BASE_FINAL = base_final,
+			ANEXO_SIEMBRAS = tabla_siembras
+		), salida_base, overwrite = TRUE)
+	cat("Archivos generados: ", salida_formateada, " y ", salida_base, "\n", sep = "")
+}
+```
+
+# Control de calidad
+
+```{r controles}
+controles <- tibble(
+	Control = c(
+		"PLOT identificado en las hojas de humedad",
+		"Fechas VT/R1 convertidas",
+		"GDU_ASI calculado como GDU_R1 - GDU_VT",
+		"MF encontrada",
+		"MC encontrada",
+		"TSG con días positivos"
+	),
+	Temprano = c(
+		n_distinct(hum_temprano_procesado$PLOT_ID),
+		sum(!is.na(ensayo_temprano_gdu$VT_CALCULO)) + sum(!is.na(ensayo_temprano_gdu$R1_CALCULO)),
+		sum(!is.na(ensayo_temprano_gdu$GDU_ASI)),
+		sum((hum_temprano_procesado %>% distinct(PLOT_ID, .keep_all = TRUE))$TIENE_MF),
+		sum((hum_temprano_procesado %>% distinct(PLOT_ID, .keep_all = TRUE))$TIENE_MC),
+		sum(!is.na((hum_temprano_procesado %>% distinct(PLOT_ID, .keep_all = TRUE))$TSG))
+	),
+	Tardio = c(
+		n_distinct(hum_tardio_procesado$PLOT_ID),
+		sum(!is.na(ensayo_tardio_gdu$VT_CALCULO)) + sum(!is.na(ensayo_tardio_gdu$R1_CALCULO)),
+		sum(!is.na(ensayo_tardio_gdu$GDU_ASI)),
+		sum((hum_tardio_procesado %>% distinct(PLOT_ID, .keep_all = TRUE))$TIENE_MF),
+		sum((hum_tardio_procesado %>% distinct(PLOT_ID, .keep_all = TRUE))$TIENE_MC),
+		sum(!is.na((hum_tardio_procesado %>% distinct(PLOT_ID, .keep_all = TRUE))$TSG))
+	)
+)
+knitr::kable(controles, format = formato_tabla, caption = "Controles de completitud")
+```
+
+Los valores `NA` no se convierten silenciosamente en cero: indican que falta una fecha climática, una medición o una madurez que debe revisarse en el Excel original.

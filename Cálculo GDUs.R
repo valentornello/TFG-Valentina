@@ -127,7 +127,6 @@ recuento_genotipos(genotipos_comunes)
 genotipos_listados_df <- lapply(genotipos_listados, function(x) recuento_genotipos(x))
 write.xlsx(genotipos_listados_df, "C:/Users/valen/Escritorio/TFG Valentina/Genotipos_Listados.xlsx", rowNames = FALSE)
 
-library(openxlsx)
 
 # Genotipos por campaña
 genotipos_listados <- list(
@@ -287,7 +286,39 @@ BLUP_base <- bind_rows(
 
 # Descargar tabla de GDUs ensayo2018-2019 en formato excel para agregarlos al excel original
 write.xlsx(excel1819, "C:/Users/valen/Escritorio/TFG Valentina/GDUs_MF_MC_2018-19.xlsx", rowNames = FALSE)
-
+library(tinytex)
 # Guardar el pdf del Rmd Informe_GDU_MF_MC.Rmd
-rmarkdown::render("Informe_GDU_MF_MC.Rmd", output_format = "pdf_document")
+rmarkdown::render("Lógica MF y MC 2018-19.Rmd", output_format = "pdf_document")
 
+# Detectar desvíos de madurez fisiológica (en días) entre los dos bloques del mismo pedigree
+# Tiene que haber dos bloques para temprano y tardío en campañas 201819
+# Tabla con los desvíos de madurez fisiológica (MF) y madurez comercial (MC)
+# entre los dos bloques del mismo pedigree, agrupando por Ensayo y Pedigree.
+
+# Crear una tabla con una fila por combinación Ensayo-Pedigree.
+# El desvío se calcula como bloque 2 menos bloque 1, en días.
+# Se conservan también los pedigrees que tienen un solo bloque.
+desvios_madurez <- excel1819 %>%
+  mutate(Bloque = as.character(BLOCK)) %>%
+  arrange(Ensayo, PEDIGREE, Bloque) %>%
+  group_by(Ensayo, PEDIGREE) %>%
+  summarise(
+    Bloque_1 = if ("1" %in% Bloque) "1" else "Ausente",
+    Bloque_2 = if ("2" %in% Bloque) "2" else "Ausente",
+    Desvio_MF_dias = if (n() == 2 && all(c("1", "2") %in% Bloque)) {
+      as.numeric(MF[match("2", Bloque)] - MF[match("1", Bloque)])
+    } else {
+      NA_real_
+    },
+    Desvio_MC_dias = if (n() == 2 && all(c("1", "2") %in% Bloque)) {
+      as.numeric(MC[match("2", Bloque)] - MC[match("1", Bloque)])
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  ) %>%
+  arrange(Ensayo, PEDIGREE)
+desvios_madurez
+
+# Descargar tabla de desvíos de madurez fisiológica (MF) y madurez comercial (MC) entre los dos bloques del mismo pedigree en formato excel
+write.xlsx(desvios_madurez, "C:/Users/valen/Escritorio/TFG Valentina/Desvios_MF_MC_2018-19.xlsx", rowNames = FALSE) 
